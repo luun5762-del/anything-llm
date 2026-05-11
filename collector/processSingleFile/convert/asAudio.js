@@ -1,18 +1,82 @@
 const { v4 } = require("uuid");
+const fs = require("fs");
 const {
   createdDate,
   trashFile,
   writeToServerDocuments,
 } = require("../../utils/files");
+const { MimeDetector } = require("../../utils/files/mime");
 const { tokenizeString } = require("../../utils/tokenizer");
 const { default: slugify } = require("slugify");
-const { LocalWhisper } = require("../../utils/WhisperProviders/localWhisper");
-const { OpenAiWhisper } = require("../../utils/WhisperProviders/OpenAiWhisper");
 
-const WHISPER_PROVIDERS = {
-  openai: OpenAiWhisper,
-  local: LocalWhisper,
-};
+const REMOTE_TRANSCRIPTION_ENDPOINT =
+  process.env.AUDIO_TRANSCRIPTION_ENDPOINT ||
+  "http://10.0.70.132:5000/transcribe";
+
+function getMimeType(fullFilePath) {
+  try {
+    return (
+      new MimeDetector().getType(fullFilePath) || "application/octet-stream"
+    );
+  } catch {
+    return "application/octet-stream";
+  }
+}
+
+async function transcribeWithRemoteService(fullFilePath, filename) {
+  try {
+    const audioBuffer = fs.readFileSync(fullFilePath);
+    const formData = new FormData();
+    formData.append(
+      "file",
+      new Blob([audioBuffer], { type: getMimeType(fullFilePath) }),
+      filename
+    );
+
+    const response = await fetch(REMOTE_TRANSCRIPTION_ENDPOINT, {
+      method: "POST",
+      body: formData,
+    });
+    const responseBody = await response.text();
+
+    if (!response.ok) {
+      return {
+        content: null,
+        error:
+          responseBody ||
+          `Remote transcription service returned ${response.status} ${response.statusText}.`,
+      };
+    }
+
+    let payload = null;
+    try {
+      payload = JSON.parse(responseBody);
+    } catch {
+      return {
+        content: null,
+        error: "Remote transcription service did not return valid JSON.",
+      };
+    }
+
+    const content =
+      typeof payload?.transcript === "string" ? payload.transcript.trim() : "";
+    if (!content) {
+      return {
+        content: null,
+        error: "Remote transcription service returned an empty transcript.",
+      };
+    }
+
+    return { content, error: null };
+  } catch (error) {
+    return {
+      content: null,
+      error:
+        error?.message ||
+        "An unknown error occurred while calling the remote transcription service.",
+    };
+  }
+}
 
 async function asAudio({
   fullFilePath = "",
@@ -20,15 +84,14 @@ async function asAudio({
   options = {},
   metadata = {},
 }) {
-  const WhisperProvider = WHISPER_PROVIDERS.hasOwnProperty(
-    options?.whisperProvider
-  )
-    ? WHISPER_PROVIDERS[options?.whisperProvider]
-    : WHISPER_PROVIDERS.local;
-
   console.log(`-- Working ${filename} --`);
-  const whisper = new WhisperProvider({ options });
-  const { content, error } = await whisper.processFile(fullFilePath, filename);
+  console.log(
+    `[Collector] Sending ${filename} to ${REMOTE_TRANSCRIPTION_ENDPOINT} for transcription.`
+  );
+  const { content, error } = await transcribeWithRemoteService(
+    fullFilePath,
+    filename
+  );
 
   if (!!error) {
     console.error(`Error encountered for parsing of ${filename}.`);
@@ -50,14 +113,17 @@ async function asAudio({
     };
   }
 
+  const transcriptFilename = `${filename}.txt`;
   const data = {
     id: v4(),
     url: "file://" + fullFilePath,
-    title: metadata.title || filename,
+    title: metadata.title || transcriptFilename,
     docAuthor: metadata.docAuthor || "no author found",
     description: metadata.description || "No description found.",
-    docSource: metadata.docSource || "audio file uploaded by the user.",
-    chunkSource: metadata.chunkSource || "",
+    docSource:
+      metadata.docSource ||
+      "audio file uploaded by the user and transcribed remotely.",
+    chunkSource: metadata.chunkSource || transcriptFilename,
     published: createdDate(fullFilePath),
     wordCount: content.split(" ").length,
     pageContent: content,
@@ -66,7 +132,7 @@ async function asAudio({
 
   const document = writeToServerDocuments({
     data,
-    filename: `${slugify(filename)}-${data.id}`,
+    filename: `${slugify(transcriptFilename)}-${data.id}`,
     options: { parseOnly: options.parseOnly },
   });
   if (!options.absolutePath) trashFile(fullFilePath);
