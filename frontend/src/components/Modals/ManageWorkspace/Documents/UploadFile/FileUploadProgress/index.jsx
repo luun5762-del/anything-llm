@@ -3,6 +3,7 @@ import truncate from "truncate";
 import { CheckCircle, XCircle } from "@phosphor-icons/react";
 import Workspace from "../../../../../../models/workspace";
 import { humanFileSize, milliToHms } from "../../../../../../utils/numbers";
+import { downloadTranscriptFile } from "../../../../../../utils/downloadTranscript";
 import PreLoader from "../../../../../Preloader";
 
 function FileUploadProgressComponent({
@@ -53,6 +54,7 @@ function FileUploadProgressComponent({
         onUploadError(data.error);
         setError(data.error);
       } else {
+        downloadTranscriptFile(data?.transcriptDownload);
         setLoading(false);
         setLoadingMessage("");
         setStatus("complete");
