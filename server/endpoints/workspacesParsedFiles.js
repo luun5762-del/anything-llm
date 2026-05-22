@@ -11,6 +11,7 @@ const { validWorkspaceSlug } = require("../utils/middleware/validWorkspace");
 const { CollectorApi } = require("../utils/collectorApi");
 const { WorkspaceThread } = require("../models/workspaceThread");
 const { WorkspaceParsedFiles } = require("../models/workspaceParsedFiles");
+const { transcriptDownloadFor } = require("../utils/audioTranscriptDownload");
 
 function workspaceParsedFilesEndpoints(app) {
   if (!app) return;
@@ -166,6 +167,10 @@ function workspaceParsedFilesEndpoints(app) {
         const files = await Promise.all(
           documents.map(async (doc) => {
             const metadata = { ...doc };
+            const transcriptDownload = transcriptDownloadFor(
+              originalname,
+              doc
+            );
             // Strip out pageContent
             delete metadata.pageContent;
             const filename = `${originalname}-${doc.id}.json`;
@@ -179,7 +184,7 @@ function workspaceParsedFilesEndpoints(app) {
             });
 
             if (dbError) throw new Error(dbError);
-            return file;
+            return transcriptDownload ? { ...file, transcriptDownload } : file;
           })
         );
 

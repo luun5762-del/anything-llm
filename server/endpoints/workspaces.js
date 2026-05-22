@@ -32,6 +32,7 @@ const {
 } = require("../utils/files/pfp");
 const { getTTSProvider } = require("../utils/TextToSpeech");
 const { WorkspaceThread } = require("../models/workspaceThread");
+const { transcriptDownloadFor } = require("../utils/audioTranscriptDownload");
 
 const truncate = require("truncate");
 const { purgeDocument } = require("../utils/files/purgeDocument");
@@ -133,7 +134,7 @@ function workspaceEndpoints(app) {
           return;
         }
 
-        const { success, reason } =
+        const { success, reason, documents = [] } =
           await Collector.processDocument(originalname);
         if (!success) {
           response.status(500).json({ success: false, error: reason }).end();
@@ -151,7 +152,15 @@ function workspaceEndpoints(app) {
           },
           response.locals?.user?.id
         );
-        response.status(200).json({ success: true, error: null });
+        const transcriptDownload = transcriptDownloadFor(
+          originalname,
+          documents[0]
+        );
+        response.status(200).json({
+          success: true,
+          error: null,
+          ...(transcriptDownload ? { transcriptDownload } : {}),
+        });
       } catch (e) {
         console.error(e.message, e);
         response.sendStatus(500).end();
@@ -960,10 +969,15 @@ function workspaceEndpoints(app) {
             .status(200)
             .json({ success: false, error: errors?.[0], document: null });
 
+        const transcriptDownload = transcriptDownloadFor(
+          originalname,
+          document
+        );
         response.status(200).json({
           success: true,
           error: null,
           document: { id: document.id, location: document.location },
+          ...(transcriptDownload ? { transcriptDownload } : {}),
         });
       } catch (e) {
         console.error(e.message, e);
