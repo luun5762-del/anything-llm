@@ -1,467 +1,481 @@
-import { useState, useEffect, useContext, useRef } from "react";
-import ChatHistory from "./ChatHistory";
-import { CLEAR_ATTACHMENTS_EVENT, DndUploaderContext } from "./DnDWrapper";
-import PromptInput, {
-  PROMPT_INPUT_EVENT,
-  PROMPT_INPUT_ID,
-} from "./PromptInput";
-import Workspace from "@/models/workspace";
-import handleChat, { ABORT_STREAM_EVENT } from "@/utils/chat";
-import { isMobile } from "react-device-detect";
-import { SidebarMobileHeader } from "../../Sidebar";
-import { useNavigate } from "react-router-dom";
+import { useState, useEffect, createContext, useContext } from "react";
 import { v4 } from "uuid";
-import handleSocketResponse, {
-  websocketURI,
-  AGENT_SESSION_END,
-  AGENT_SESSION_START,
-  setAgentSessionActive,
-} from "@/utils/chat/agent";
-import DnDFileUploaderWrapper from "./DnDWrapper";
-import SpeechRecognition, {
-  useSpeechRecognition,
-} from "react-speech-recognition";
-import { ChatTooltips } from "./ChatTooltips";
-import { MetricsProvider } from "./ChatHistory/HistoricalMessage/Actions/RenderMetrics";
-import useChatContainerQuickScroll from "@/hooks/useChatContainerQuickScroll";
-import { PENDING_HOME_MESSAGE } from "@/utils/constants";
-import { clearPromptInputDraft } from "@/hooks/usePromptInputStorage";
-import { safeJsonParse } from "@/utils/request";
-import { useTranslation } from "react-i18next";
-import paths from "@/utils/paths";
-import QuickActions from "@/components/lib/QuickActions";
-import SuggestedMessages from "@/components/lib/SuggestedMessages";
-import TextSizeMenu from "./TextSizeMenu";
-import WorkspaceModelPicker from "./WorkspaceModelPicker";
-import SourcesSidebar, { SourcesSidebarProvider } from "./SourcesSidebar";
+import System from "@/models/system";
+import { useDropzone } from "react-dropzone";
+import DndIcon from "./dnd-icon.png";
+import Workspace from "@/models/workspace";
+import showToast from "@/utils/toast";
+import { downloadTranscriptFile } from "@/utils/downloadTranscript";
+import FileUploadWarningModal from "./FileUploadWarningModal";
+import pluralize from "pluralize";
 
-export default function ChatContainer({
+export const DndUploaderContext = createContext();
+export const REMOVE_ATTACHMENT_EVENT = "ATTACHMENT_REMOVE";
+export const CLEAR_ATTACHMENTS_EVENT = "ATTACHMENT_CLEAR";
+export const PASTE_ATTACHMENT_EVENT = "ATTACHMENT_PASTED";
+export const ATTACHMENTS_PROCESSING_EVENT = "ATTACHMENTS_PROCESSING";
+export const ATTACHMENTS_PROCESSED_EVENT = "ATTACHMENTS_PROCESSED";
+export const PARSED_FILE_ATTACHMENT_REMOVED_EVENT =
+  "PARSED_FILE_ATTACHMENT_REMOVED";
+
+/**
+ * File Attachment for automatic upload on the chat container page.
+ * @typedef Attachment
+ * @property {string} uid - unique file id.
+ * @property {File} file - native File object
+ * @property {string|null} contentString - base64 encoded string of file
+ * @property {('in_progress'|'failed'|'embedded'|'added_context')} status - the automatic upload status.
+ * @property {string|null} error - Error message
+ * @property {{id:string, location:string}|null} document - uploaded document details
+ * @property {('attachment'|'upload')} type - The type of upload. Attachments are chat-specific, uploads go to the workspace.
+ */
+
+/**
+ * @typedef {Object} ParsedFile
+ * @property {number} id - The id of the parsed file.
+ * @property {string} filename - The name of the parsed file.
+ * @property {number} workspaceId - The id of the workspace the parsed file belongs to.
+ * @property {string|null} userId - The id of the user the parsed file belongs to.
+ * @property {string|null} threadId - The id of the thread the parsed file belongs to.
+ * @property {string} metadata - The metadata of the parsed file.
+ * @property {number} tokenCountEstimate - The estimated token count of the parsed file.
+ */
+
+export function DnDFileUploaderProvider({
   workspace,
   threadSlug = null,
-  knownHistory = [],
+  children,
 }) {
-  const navigate = useNavigate();
-  const { t } = useTranslation();
-  const [loadingResponse, setLoadingResponse] = useState(false);
-  const [chatHistory, setChatHistory] = useState(knownHistory);
-  const [socketId, setSocketId] = useState(null);
-  const [websocket, setWebsocket] = useState(null);
-  const { files, parseAttachments } = useContext(DndUploaderContext);
-  const { chatHistoryRef } = useChatContainerQuickScroll();
-  const pendingMessageChecked = useRef(false);
-  const pendingResetRef = useRef(false);
+  const [files, setFiles] = useState([]);
+  const [ready, setReady] = useState(false);
+  const [dragging, setDragging] = useState(false);
+  const [showWarningModal, setShowWarningModal] = useState(false);
+  const [isEmbedding, setIsEmbedding] = useState(false);
+  const [embedProgress, setEmbedProgress] = useState(0);
+  const [pendingFiles, setPendingFiles] = useState([]);
+  const [tokenCount, setTokenCount] = useState(0);
+  const [maxTokens, setMaxTokens] = useState(Number.POSITIVE_INFINITY);
 
-  const { listening, resetTranscript } = useSpeechRecognition({
-    clearTranscriptOnListen: true,
-  });
+  useEffect(() => {
+    System.checkDocumentProcessorOnline().then((status) => setReady(status));
+  }, []);
 
-  /**
-   * Emit an update to the state of the prompt input without directly
-   * passing a prop in so that it does not re-render constantly.
-   * @param {string} messageContent - The message content to set
-   * @param {'replace' | 'append'} writeMode - Replace current text or append to existing text (default: replace)
-   */
-  function setMessageEmit(messageContent = "", writeMode = "replace") {
-    window.dispatchEvent(
-      new CustomEvent(PROMPT_INPUT_EVENT, {
-        detail: { messageContent, writeMode },
-      })
+  useEffect(() => {
+    window.addEventListener(REMOVE_ATTACHMENT_EVENT, handleRemove);
+    window.addEventListener(CLEAR_ATTACHMENTS_EVENT, resetAttachments);
+    window.addEventListener(PASTE_ATTACHMENT_EVENT, handlePastedAttachment);
+    window.addEventListener(
+      PARSED_FILE_ATTACHMENT_REMOVED_EVENT,
+      handleRemoveParsedFile
     );
-  }
-
-  const handleSubmit = async (event) => {
-    event.preventDefault();
-    const currentMessage =
-      document.getElementById(PROMPT_INPUT_ID)?.value || "";
-    if (!currentMessage) return false;
-
-    // Clear the localStorage draft for this thread/workspace so that if the
-    // PromptInput remounts (empty→chat transition), it won't restore stale text
-    clearPromptInputDraft(threadSlug ?? workspace.slug);
-
-    const prevChatHistory = [
-      ...chatHistory,
-      {
-        content: currentMessage,
-        role: "user",
-        attachments: parseAttachments(),
-      },
-      {
-        content: "",
-        role: "assistant",
-        pending: true,
-        userMessage: currentMessage,
-        animate: true,
-      },
-    ];
-
-    if (listening) {
-      // Stop the mic if the send button is clicked
-      endSTTSession();
-    }
-    setChatHistory(prevChatHistory);
-    setMessageEmit("");
-    setLoadingResponse(true);
-  };
-
-  function endSTTSession() {
-    SpeechRecognition.stopListening();
-    resetTranscript();
-  }
-
-  const regenerateAssistantMessage = (chatId) => {
-    const updatedHistory = chatHistory.slice(0, -1);
-    const lastUserMessage = updatedHistory.slice(-1)[0];
-    Workspace.deleteChats(workspace.slug, [chatId])
-      .then(() =>
-        sendCommand({
-          text: lastUserMessage.content,
-          autoSubmit: true,
-          history: updatedHistory,
-          attachments: lastUserMessage?.attachments,
-        })
-      )
-      .catch((e) => console.error(e));
-  };
-
-  /**
-   * Send a command to the LLM prompt input.
-   * @param {Object} options - Arguments to send to the LLM
-   * @param {string} options.text - The text to send to the LLM
-   * @param {boolean} options.autoSubmit - Determines if the text should be sent immediately or if it should be added to the message state (default: false)
-   * @param {Object[]} options.history - The history of the chat prior to this message for overriding the current chat history
-   * @param {Object[import("./DnDWrapper").Attachment]} options.attachments - The attachments to send to the LLM for this message
-   * @param {'replace' | 'append' | 'prepend'} options.writeMode - Replace current text or append to existing text (default: replace)
-   * @returns {void}
-   */
-  const sendCommand = async ({
-    text = "",
-    autoSubmit = false,
-    history = [],
-    attachments = [],
-    writeMode = "replace",
-  } = {}) => {
-    // If we are not auto-submitting, we can just emit the text to the prompt input.
-    if (!autoSubmit) {
-      setMessageEmit(text, writeMode);
-      return;
-    }
-
-    if (writeMode === "prepend") {
-      const currentText = document.getElementById(PROMPT_INPUT_ID)?.value ?? "";
-      text = currentText + " " + text;
-    }
-
-    // If we are auto-submitting in append mode
-    // than we need to update text with whatever is in the prompt input + the text we are sending.
-    // @note: `message` will not work here since it is not updated yet.
-    // If text is still empty, after this, then we should just return.
-    if (writeMode === "append") {
-      const currentText = document.getElementById(PROMPT_INPUT_ID)?.value ?? "";
-      text = currentText + text;
-    }
-
-    if (!text || text === "") return false;
-
-    // Clear the localStorage draft so that if the PromptInput remounts
-    // (e.g. /reset causing empty→chat or chat→empty transitions),
-    // it won't restore stale text.
-    clearPromptInputDraft(threadSlug ?? workspace.slug);
-
-    // If we are auto-submitting
-    // Then we can replace the current text since this is not accumulating.
-    let prevChatHistory;
-    if (history.length > 0) {
-      // use pre-determined history chain.
-      prevChatHistory = [
-        ...history,
-        {
-          content: "",
-          role: "assistant",
-          pending: true,
-          userMessage: text,
-          attachments,
-          animate: true,
-        },
-      ];
-    } else {
-      prevChatHistory = [
-        ...chatHistory,
-        {
-          content: text,
-          role: "user",
-          attachments,
-        },
-        {
-          content: "",
-          role: "assistant",
-          pending: true,
-          userMessage: text,
-          attachments,
-          animate: true,
-        },
-      ];
-    }
-
-    setChatHistory(prevChatHistory);
-    setMessageEmit("");
-    setLoadingResponse(true);
-  };
-
-  useEffect(() => {
-    if (pendingMessageChecked.current || !workspace?.slug) return;
-    pendingMessageChecked.current = true;
-
-    const pending = safeJsonParse(sessionStorage.getItem(PENDING_HOME_MESSAGE));
-    if (pending?.message) {
-      setTimeout(() => {
-        sessionStorage.removeItem(PENDING_HOME_MESSAGE);
-        sendCommand({
-          text: pending.message,
-          attachments: pending.attachments || [],
-          autoSubmit: true,
-        });
-      }, 100);
-    }
-  }, [workspace?.slug]);
-
-  useEffect(() => {
-    async function fetchReply() {
-      const promptMessage =
-        chatHistory.length > 0 ? chatHistory[chatHistory.length - 1] : null;
-      const remHistory = chatHistory.length > 0 ? chatHistory.slice(0, -1) : [];
-      var _chatHistory = [...remHistory];
-
-      // Override hook for new messages to now go to agents until the connection closes
-      if (!!websocket) {
-        if (!promptMessage || !promptMessage?.userMessage) return false;
-        const attachments = promptMessage?.attachments ?? parseAttachments();
-        window.dispatchEvent(new CustomEvent(CLEAR_ATTACHMENTS_EVENT));
-        websocket.send(
-          JSON.stringify({
-            type: "awaitingFeedback",
-            feedback: promptMessage?.userMessage,
-            attachments,
-          })
-        );
-
-        // /reset during an active agent session should end the session AND
-        // clear the chat in a single action. The send above triggers the
-        // server to abort the agent and close the socket; fall through to the
-        // /reset flow below which resets memory + clears chat history.
-        if (promptMessage.userMessage.trim() !== "/reset") return;
-        pendingResetRef.current = true;
-      }
-
-      if (!promptMessage || !promptMessage?.userMessage) return false;
-
-      // If running and edit or regeneration, this history will already have attachments
-      // so no need to parse the current state.
-      const attachments = promptMessage?.attachments ?? parseAttachments();
-      window.dispatchEvent(new CustomEvent(CLEAR_ATTACHMENTS_EVENT));
-
-      await Workspace.multiplexStream({
-        workspaceSlug: workspace.slug,
-        threadSlug,
-        prompt: promptMessage.userMessage,
-        chatHandler: (chatResult) =>
-          handleChat(
-            chatResult,
-            setLoadingResponse,
-            setChatHistory,
-            remHistory,
-            _chatHistory,
-            setSocketId
-          ),
-        attachments,
-      });
-      return;
-    }
-    loadingResponse === true && fetchReply();
-  }, [loadingResponse, chatHistory, workspace]);
-
-  // TODO: Simplify this WSS stuff
-  useEffect(() => {
-    let socket = null;
-
-    function handleWSS() {
-      try {
-        if (!socketId || !!websocket) return;
-        socket = new WebSocket(
-          `${websocketURI()}/api/agent-invocation/${socketId}`
-        );
-        socket.supportsAgentStreaming = false;
-
-        window.addEventListener(ABORT_STREAM_EVENT, () => {
-          setAgentSessionActive(false);
-          window.dispatchEvent(new CustomEvent(AGENT_SESSION_END));
-          socket?.close();
-        });
-
-        socket.addEventListener("message", (event) => {
-          setLoadingResponse(true);
-          try {
-            handleSocketResponse(socket, event, setChatHistory);
-          } catch {
-            console.error("Failed to parse data");
-            setAgentSessionActive(false);
-            window.dispatchEvent(new CustomEvent(AGENT_SESSION_END));
-            socket.close();
-          }
-          setLoadingResponse(false);
-        });
-
-        socket.addEventListener("close", (_event) => {
-          setAgentSessionActive(false);
-          window.dispatchEvent(new CustomEvent(AGENT_SESSION_END));
-          // When the close was triggered by /reset, skip the "Agent session
-          // complete." status - the pending /reset flow will clear history.
-          if (pendingResetRef.current) {
-            pendingResetRef.current = false;
-          } else {
-            setChatHistory((prev) => [
-              ...prev.filter((msg) => !!msg.content),
-              {
-                uuid: v4(),
-                type: "statusResponse",
-                content: "Agent session complete.",
-                role: "assistant",
-                sources: [],
-                closed: true,
-                error: null,
-                animate: false,
-                pending: false,
-              },
-            ]);
-          }
-          setLoadingResponse(false);
-          setWebsocket(null);
-          setSocketId(null);
-        });
-        setWebsocket(socket);
-        setAgentSessionActive(true);
-        window.dispatchEvent(new CustomEvent(AGENT_SESSION_START));
-        window.dispatchEvent(new CustomEvent(CLEAR_ATTACHMENTS_EVENT));
-      } catch (e) {
-        setChatHistory((prev) => [
-          ...prev.filter((msg) => !!msg.content),
-          {
-            uuid: v4(),
-            type: "abort",
-            content: e.message,
-            role: "assistant",
-            sources: [],
-            closed: true,
-            error: e.message,
-            animate: false,
-            pending: false,
-          },
-        ]);
-        setLoadingResponse(false);
-        setWebsocket(null);
-        setSocketId(null);
-      }
-    }
-    handleWSS();
 
     return () => {
-      if (socket) {
-        setAgentSessionActive(false);
-        window.dispatchEvent(new CustomEvent(AGENT_SESSION_END));
-        socket.close();
-      }
+      window.removeEventListener(REMOVE_ATTACHMENT_EVENT, handleRemove);
+      window.removeEventListener(CLEAR_ATTACHMENTS_EVENT, resetAttachments);
+      window.removeEventListener(
+        PARSED_FILE_ATTACHMENT_REMOVED_EVENT,
+        handleRemoveParsedFile
+      );
+      window.removeEventListener(
+        PASTE_ATTACHMENT_EVENT,
+        handlePastedAttachment
+      );
     };
-  }, [socketId]);
+  }, []);
 
-  const isEmpty =
-    chatHistory.length === 0 && !sessionStorage.getItem(PENDING_HOME_MESSAGE);
-
-  if (isEmpty) {
-    return (
-      <div
-        style={{ height: isMobile ? "100%" : "calc(100% - 32px)" }}
-        className="transition-all duration-500 relative md:ml-[2px] md:mr-[16px] md:my-[16px] md:rounded-[16px] bg-zinc-900 light:bg-white w-full h-full overflow-hidden border-none light:border-solid light:border light:border-theme-modal-border"
-      >
-        {isMobile && <SidebarMobileHeader />}
-        <TextSizeMenu />
-        <WorkspaceModelPicker workspaceSlug={workspace.slug} />
-        <DnDFileUploaderWrapper>
-          <div className="flex flex-col h-full w-full items-center justify-center">
-            <div className="flex flex-col items-center w-full max-w-[750px]">
-              <h1 className="text-white text-xl md:text-2xl mb-11 text-center">
-                {t("main-page.greeting")}
-              </h1>
-              <PromptInput
-                workspace={workspace}
-                submit={handleSubmit}
-                isStreaming={loadingResponse}
-                sendCommand={sendCommand}
-                attachments={files}
-                centered={true}
-              />
-              <QuickActions
-                hasAvailableWorkspace={!!workspace}
-                onCreateAgent={() => navigate(paths.settings.agentSkills())}
-                onEditWorkspace={() =>
-                  navigate(
-                    paths.workspace.settings.generalAppearance(workspace.slug)
-                  )
-                }
-                onUploadDocument={() =>
-                  document.getElementById("dnd-chat-file-uploader")?.click()
-                }
-              />
-            </div>
-            <SuggestedMessages
-              suggestedMessages={workspace?.suggestedMessages}
-              sendCommand={sendCommand}
-            />
-          </div>
-        </DnDFileUploaderWrapper>
-        <ChatTooltips />
-      </div>
+  /**
+   * Handles the removal of a parsed file attachment from the uploader queue.
+   * Only uses the document id to remove the file from the queue
+   * @param {CustomEvent<{document: ParsedFile}>} event
+   */
+  async function handleRemoveParsedFile(event) {
+    const { document } = event.detail;
+    setFiles((prev) =>
+      prev.filter((prevFile) => prevFile.document.id !== document.id)
     );
   }
 
+  /**
+   * Remove file from uploader queue.
+   * @param {CustomEvent<{uid: string}>} event
+   */
+  async function handleRemove(event) {
+    /** @type {{uid: Attachment['uid'], document: Attachment['document']}} */
+    const { uid, document } = event.detail;
+    setFiles((prev) => prev.filter((prevFile) => prevFile.uid !== uid));
+    if (!document?.location) return;
+    await Workspace.deleteAndUnembedFile(workspace.slug, document.location);
+  }
+
+  /**
+   * Clear queue of attached files currently in prompt box
+   */
+  function resetAttachments() {
+    setFiles([]);
+  }
+
+  /**
+   * Turns files into attachments we can send as body request to backend
+   * for a chat.
+   * @returns {{name:string,mime:string,contentString:string}[]}
+   */
+  function parseAttachments() {
+    return (
+      files
+        ?.filter((file) => file.type === "attachment")
+        ?.map(
+          (
+            /** @type {Attachment} */
+            attachment
+          ) => {
+            return {
+              name: attachment.file.name,
+              mime: attachment.file.type,
+              contentString: attachment.contentString,
+            };
+          }
+        ) || []
+    );
+  }
+
+  /**
+   * Handle pasted attachments.
+   * @param {CustomEvent<{files: File[]}>} event
+   */
+  async function handlePastedAttachment(event) {
+    const { files = [] } = event.detail;
+    if (!files.length) return;
+    const newAccepted = [];
+    for (const file of files) {
+      if (file.type.startsWith("image/")) {
+        newAccepted.push({
+          uid: v4(),
+          file,
+          contentString: await toBase64(file),
+          status: "success",
+          error: null,
+          type: "attachment",
+        });
+      } else {
+        newAccepted.push({
+          uid: v4(),
+          file,
+          contentString: null,
+          status: "in_progress",
+          error: null,
+          type: "upload",
+        });
+      }
+    }
+    setFiles((prev) => [...prev, ...newAccepted]);
+    embedEligibleAttachments(newAccepted);
+  }
+
+  /**
+   * Handle dropped files.
+   * @param {Attachment[]} acceptedFiles
+   * @param {any[]} _rejections
+   */
+  async function onDrop(acceptedFiles, _rejections) {
+    setDragging(false);
+
+    /** @type {Attachment[]} */
+    const newAccepted = [];
+    for (const file of acceptedFiles) {
+      if (file.type.startsWith("image/")) {
+        newAccepted.push({
+          uid: v4(),
+          file,
+          contentString: await toBase64(file),
+          status: "success",
+          error: null,
+          type: "attachment",
+        });
+      } else {
+        newAccepted.push({
+          uid: v4(),
+          file,
+          contentString: null,
+          status: "in_progress",
+          error: null,
+          type: "upload",
+        });
+      }
+    }
+
+    setFiles((prev) => [...prev, ...newAccepted]);
+    embedEligibleAttachments(newAccepted);
+  }
+
+  /**
+   * Embeds attachments that are eligible for embedding - basically files that are not images.
+   * @param {Attachment[]} newAttachments
+   */
+  async function embedEligibleAttachments(newAttachments = []) {
+    window.dispatchEvent(new CustomEvent(ATTACHMENTS_PROCESSING_EVENT));
+    const promises = [];
+
+    const { currentContextTokenCount, contextWindow } =
+      await Workspace.getParsedFiles(workspace.slug, threadSlug);
+    const workspaceContextWindow = contextWindow
+      ? Math.floor(contextWindow * Workspace.maxContextWindowLimit)
+      : Number.POSITIVE_INFINITY;
+    setMaxTokens(workspaceContextWindow);
+
+    let totalTokenCount = currentContextTokenCount;
+    let batchPendingFiles = [];
+
+    for (const attachment of newAttachments) {
+      // Images/attachments are chat specific.
+      if (attachment.type === "attachment") continue;
+
+      const formData = new FormData();
+      formData.append("file", attachment.file, attachment.file.name);
+      formData.append("threadSlug", threadSlug || null);
+      promises.push(
+        Workspace.parseFile(workspace.slug, formData).then(
+          async ({ response, data }) => {
+            if (!response.ok) {
+              const updates = {
+                status: "failed",
+                error: data?.error ?? null,
+              };
+              setFiles((prev) =>
+                prev.map(
+                  (
+                    /** @type {Attachment} */
+                    prevFile
+                  ) =>
+                    prevFile.uid !== attachment.uid
+                      ? prevFile
+                      : { ...prevFile, ...updates }
+                )
+              );
+              return;
+            }
+            // Will always be one file in the array
+            /** @type {ParsedFile} */
+            const { transcriptDownload, ...file } = data.files[0];
+            downloadTranscriptFile(transcriptDownload);
+
+            // Add token count for this file
+            // and add it to the batch pending files
+            totalTokenCount += file.tokenCountEstimate;
+            batchPendingFiles.push({
+              attachment,
+              parsedFileId: file.id,
+              tokenCount: file.tokenCountEstimate,
+            });
+
+            if (totalTokenCount > workspaceContextWindow) {
+              setTokenCount(totalTokenCount);
+              setPendingFiles(batchPendingFiles);
+              setShowWarningModal(true);
+              return;
+            }
+
+            // File is within limits, keep in parsed files
+            const result = { success: true, document: file };
+            const updates = {
+              status: result.success ? "added_context" : "failed",
+              error: result.error ?? null,
+              document: result.document,
+            };
+
+            setFiles((prev) =>
+              prev.map(
+                (
+                  /** @type {Attachment} */
+                  prevFile
+                ) =>
+                  prevFile.uid !== attachment.uid
+                    ? prevFile
+                    : { ...prevFile, ...updates }
+              )
+            );
+          }
+        )
+      );
+    }
+
+    // Wait for all promises to resolve in some way before dispatching the event to unlock the send button
+    Promise.all(promises).finally(() =>
+      window.dispatchEvent(new CustomEvent(ATTACHMENTS_PROCESSED_EVENT))
+    );
+  }
+
+  // Handle modal actions
+  const handleCloseModal = async () => {
+    if (!pendingFiles.length) return;
+
+    // Delete all files from this batch
+    await Workspace.deleteParsedFiles(
+      workspace.slug,
+      pendingFiles.map((file) => file.parsedFileId)
+    );
+
+    // Remove all files from this batch from the UI
+    setFiles((prev) =>
+      prev.filter(
+        (prevFile) =>
+          !pendingFiles.some((file) => file.attachment.uid === prevFile.uid)
+      )
+    );
+    setShowWarningModal(false);
+    setPendingFiles([]);
+    setTokenCount(0);
+    window.dispatchEvent(new CustomEvent(ATTACHMENTS_PROCESSED_EVENT));
+  };
+
+  const handleContinueAnyway = async () => {
+    if (!pendingFiles.length) return;
+    const results = pendingFiles.map((file) => ({
+      success: true,
+      document: { id: file.parsedFileId },
+    }));
+
+    const fileUpdates = pendingFiles.map((file, i) => ({
+      uid: file.attachment.uid,
+      updates: {
+        status: results[i].success ? "success" : "failed",
+        error: results[i].error ?? null,
+        document: results[i].document,
+      },
+    }));
+
+    setFiles((prev) =>
+      prev.map((prevFile) => {
+        const update = fileUpdates.find((f) => f.uid === prevFile.uid);
+        return update ? { ...prevFile, ...update.updates } : prevFile;
+      })
+    );
+    setShowWarningModal(false);
+    setPendingFiles([]);
+    setTokenCount(0);
+  };
+
+  const handleEmbed = async () => {
+    if (!pendingFiles.length) return;
+    setIsEmbedding(true);
+    setEmbedProgress(0);
+
+    // Embed all pending files
+    let completed = 0;
+    const results = await Promise.all(
+      pendingFiles.map((file) =>
+        Workspace.embedParsedFile(workspace.slug, file.parsedFileId).then(
+          (result) => {
+            completed++;
+            setEmbedProgress(completed);
+            return result;
+          }
+        )
+      )
+    );
+
+    // Update status for all files
+    const fileUpdates = pendingFiles.map((file, i) => ({
+      uid: file.attachment.uid,
+      updates: {
+        status: results[i].response.ok ? "embedded" : "failed",
+        error: results[i].data?.error ?? null,
+        document: results[i].data?.document,
+      },
+    }));
+
+    setFiles((prev) =>
+      prev.map((prevFile) => {
+        const update = fileUpdates.find((f) => f.uid === prevFile.uid);
+        return update ? { ...prevFile, ...update.updates } : prevFile;
+      })
+    );
+    setShowWarningModal(false);
+    setPendingFiles([]);
+    setTokenCount(0);
+    setIsEmbedding(false);
+    window.dispatchEvent(new CustomEvent(ATTACHMENTS_PROCESSED_EVENT));
+    showToast(
+      `${pendingFiles.length} ${pluralize("file", pendingFiles.length)} embedded successfully`,
+      "success"
+    );
+  };
+
   return (
-    <SourcesSidebarProvider>
-      <div
-        style={{ height: isMobile ? "100%" : "calc(100% - 32px)" }}
-        className="relative flex md:ml-[2px] md:mr-[16px] md:my-[16px] w-full h-full z-[2]"
-      >
-        <TextSizeMenu />
-        <div className="flex-1 min-w-0 transition-all duration-500 relative md:rounded-[16px] bg-zinc-900 light:bg-white text-white light:text-slate-900 h-full overflow-hidden border-none light:border-solid light:border light:border-theme-modal-border">
-          {isMobile && <SidebarMobileHeader />}
-          <WorkspaceModelPicker workspaceSlug={workspace.slug} />
-          <DnDFileUploaderWrapper>
-            <div className="flex flex-col h-full w-full pb-20 md:pb-0">
-              <div className="contents">
-                <MetricsProvider>
-                  <ChatHistory
-                    ref={chatHistoryRef}
-                    history={chatHistory}
-                    workspace={workspace}
-                    sendCommand={sendCommand}
-                    updateHistory={setChatHistory}
-                    regenerateAssistantMessage={regenerateAssistantMessage}
-                    websocket={websocket}
-                  />
-                </MetricsProvider>
-                <PromptInput
-                  workspace={workspace}
-                  submit={handleSubmit}
-                  isStreaming={loadingResponse}
-                  sendCommand={sendCommand}
-                  attachments={files}
-                  centered={false}
-                />
-              </div>
-            </div>
-          </DnDFileUploaderWrapper>
-          <ChatTooltips />
-        </div>
-        <SourcesSidebar />
-      </div>
-    </SourcesSidebarProvider>
+    <DndUploaderContext.Provider
+      value={{ files, ready, dragging, setDragging, onDrop, parseAttachments }}
+    >
+      <FileUploadWarningModal
+        show={showWarningModal}
+        onClose={handleCloseModal}
+        onContinue={handleContinueAnyway}
+        onEmbed={handleEmbed}
+        tokenCount={tokenCount}
+        maxTokens={maxTokens}
+        fileCount={pendingFiles.length}
+        isEmbedding={isEmbedding}
+        embedProgress={embedProgress}
+      />
+      {children}
+    </DndUploaderContext.Provider>
   );
+}
+
+export default function DnDFileUploaderWrapper({ children }) {
+  const { onDrop, ready, dragging, setDragging } =
+    useContext(DndUploaderContext);
+  const { getRootProps, getInputProps } = useDropzone({
+    onDrop,
+    disabled: !ready,
+    noClick: true,
+    noKeyboard: true,
+    onDragEnter: () => setDragging(true),
+    onDragLeave: () => setDragging(false),
+  });
+
+  return (
+    <div
+      className={`relative flex flex-col h-full w-full md:mt-0 mt-[40px] p-[1px]`}
+      {...getRootProps()}
+    >
+      <div
+        hidden={!dragging}
+        className="absolute top-0 w-full h-full bg-dark-text/90 light:bg-[#C2E7FE]/90 rounded-2xl border-[4px] border-white z-[9999]"
+      >
+        <div className="w-full h-full flex justify-center items-center rounded-xl">
+          <div className="flex flex-col gap-y-[14px] justify-center items-center">
+            <img
+              src={DndIcon}
+              width={69}
+              height={69}
+              alt="Drag and drop icon"
+            />
+            <p className="text-white text-[24px] font-semibold">Add anything</p>
+            <p className="text-white text-[16px] text-center">
+              Drop a file or image here to attach it to your <br />
+              workspace auto-magically.
+            </p>
+          </div>
+        </div>
+      </div>
+      <input id="dnd-chat-file-uploader" {...getInputProps()} />
+      {children}
+    </div>
+  );
+}
+
+/**
+ * Convert image types into Base64 strings for requests.
+ * @param {File} file
+ * @returns {Promise<string>}
+ */
+async function toBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const base64String = reader.result.split(",")[1];
+      resolve(`data:${file.type};base64,${base64String}`);
+    };
+    reader.onerror = (error) => reject(error);
+    reader.readAsDataURL(file);
+  });
 }
