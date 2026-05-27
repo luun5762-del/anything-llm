@@ -1,5 +1,6 @@
 const { v4 } = require("uuid");
 const fs = require("fs");
+const { Agent } = require("undici");
 const {
   createdDate,
   trashFile,
@@ -12,6 +13,28 @@ const { default: slugify } = require("slugify");
 const REMOTE_TRANSCRIPTION_ENDPOINT =
   process.env.AUDIO_TRANSCRIPTION_ENDPOINT ||
   "http://10.0.70.132:5000/transcribe";
+const REMOTE_TRANSCRIPTION_TIMEOUT_MS = parseTimeoutEnv(
+  process.env.AUDIO_TRANSCRIPTION_TIMEOUT_MS,
+  60 * 60_000
+);
+const REMOTE_TRANSCRIPTION_AGENT = new Agent({
+  headersTimeout: REMOTE_TRANSCRIPTION_TIMEOUT_MS,
+  bodyTimeout: REMOTE_TRANSCRIPTION_TIMEOUT_MS,
+});
+
+function parseTimeoutEnv(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function remoteTranscriptionErrorMessage(error) {
+  const message =
+    error?.message ||
+    "An unknown error occurred while calling the remote transcription service.";
+  const cause = error?.cause;
+  const causeMessage = cause?.message || cause?.code || cause?.name;
+  return causeMessage ? `${message} (${causeMessage})` : message;
+}
 
 function getMimeType(fullFilePath) {
   try {
@@ -36,6 +59,7 @@ async function transcribeWithRemoteService(fullFilePath, filename) {
     const response = await fetch(REMOTE_TRANSCRIPTION_ENDPOINT, {
       method: "POST",
       body: formData,
+      dispatcher: REMOTE_TRANSCRIPTION_AGENT,
     });
     const responseBody = await response.text();
 
@@ -71,9 +95,7 @@ async function transcribeWithRemoteService(fullFilePath, filename) {
   } catch (error) {
     return {
       content: null,
-      error:
-        error?.message ||
-        "An unknown error occurred while calling the remote transcription service.",
+      error: remoteTranscriptionErrorMessage(error),
     };
   }
 }
