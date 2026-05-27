@@ -1,6 +1,24 @@
 const { EncryptionManager } = require("../EncryptionManager");
 const { Agent } = require("undici");
 
+function parseTimeoutEnv(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function fetchErrorMessage(error) {
+  const message = error?.message || "Collector request failed";
+  const cause = error?.cause;
+  const causeMessage = cause?.message || cause?.code || cause?.name;
+  return causeMessage ? `${message} (${causeMessage})` : message;
+}
+
+const DOCUMENT_REQUEST_TIMEOUT_MS = parseTimeoutEnv(
+  process.env.COLLECTOR_DOCUMENT_PROCESSING_TIMEOUT_MS ||
+    process.env.AUDIO_TRANSCRIPTION_TIMEOUT_MS,
+  60 * 60_000
+);
+
 /**
  * @typedef {Object} CollectorOptions
  * @property {string} whisperProvider - The provider to use for whisper, defaults to "local"
@@ -17,10 +35,17 @@ const { Agent } = require("undici");
 class CollectorApi {
   /** @type {number} - The maximum timeout for extension requests in milliseconds */
   extensionRequestTimeout = 15 * 60_000; // 15 minutes
+  /** @type {number} - The maximum timeout for document parse/process requests in milliseconds */
+  documentRequestTimeout = DOCUMENT_REQUEST_TIMEOUT_MS;
   /** @type {Agent} - The agent for extension requests */
   extensionRequestAgent = new Agent({
     headersTimeout: this.extensionRequestTimeout,
     bodyTimeout: this.extensionRequestTimeout,
+  });
+  /** @type {Agent} - The agent for document parse/process requests */
+  documentRequestAgent = new Agent({
+    headersTimeout: this.documentRequestTimeout,
+    bodyTimeout: this.documentRequestTimeout,
   });
 
   constructor() {
@@ -97,7 +122,7 @@ class CollectorApi {
         ),
       },
       body: data,
-      dispatcher: new Agent({ headersTimeout: 600000 }),
+      dispatcher: this.documentRequestAgent,
     })
       .then((res) => {
         if (!res.ok) throw new Error("Response could not be completed");
@@ -105,8 +130,9 @@ class CollectorApi {
       })
       .then((res) => res)
       .catch((e) => {
-        this.log(e.message);
-        return { success: false, reason: e.message, documents: [] };
+        const reason = fetchErrorMessage(e);
+        this.log(reason);
+        return { success: false, reason, documents: [] };
       });
   }
 
@@ -145,8 +171,9 @@ class CollectorApi {
       })
       .then((res) => res)
       .catch((e) => {
-        this.log(e.message);
-        return { success: false, reason: e.message, documents: [] };
+        const reason = fetchErrorMessage(e);
+        this.log(reason);
+        return { success: false, reason, documents: [] };
       });
   }
 
@@ -281,6 +308,7 @@ class CollectorApi {
         ),
       },
       body: data,
+      dispatcher: this.documentRequestAgent,
     })
       .then((res) => {
         if (!res.ok) throw new Error("Response could not be completed");
@@ -288,8 +316,9 @@ class CollectorApi {
       })
       .then((res) => res)
       .catch((e) => {
-        this.log(e.message);
-        return { success: false, reason: e.message, documents: [] };
+        const reason = fetchErrorMessage(e);
+        this.log(reason);
+        return { success: false, reason, documents: [] };
       });
   }
 }
